@@ -1,4 +1,3 @@
-
 '''
 PURES OVERVIEW please dont touch
 how will this flow?
@@ -27,6 +26,8 @@ from discord.ext import commands
 #adds background loop (guard) for reconnect/leave behaviour
 from discord.ext import tasks
 
+from pathlib import Path
+
 
 
 class JoinSound(commands.Cog):
@@ -41,6 +42,17 @@ class JoinSound(commands.Cog):
         self.AUDIO_FILE = "join.mp3"
         self.COOLDOWN_SECONDS = 15
         self.CONFIG_FILE = "join_config.json"
+
+        #soundboard folder + per-user mapping file (Option A)
+        #users will pick 1 sound from the approved list in the sounds folder
+        self.SOUNDS_DIR = "sounds"
+        self.USER_SOUNDS_FILE = "user_sounds.json"
+
+        #stores user choices: user_id(str) -> filename(str)
+        self.user_sounds = {}
+
+        #ensure sounds folder exists
+        Path(self.SOUNDS_DIR).mkdir(parents=True, exist_ok=True)
 
         #if we want to exclude nitro users (to avoid audio clash)
         #we need to make a new role in disc e.g. NitroUser
@@ -69,6 +81,9 @@ class JoinSound(commands.Cog):
         #load saved config when cog loads
         self.load_config()
 
+        #load saved user sound choices
+        self.load_user_sounds()
+
 
     #opens join_config.json, loads saved channel IDs into memory, if file doesnt exist starts empty
     def load_config(self):
@@ -86,6 +101,58 @@ class JoinSound(commands.Cog):
     def save_config(self):
         with open(self.CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(self.config, f, indent=2)
+
+
+    #opens user_sounds.json, loads saved user sound selections, if file doesnt exist starts empty
+    def load_user_sounds(self):
+        try:
+            with open(self.USER_SOUNDS_FILE, "r", encoding="utf-8") as f:
+                self.user_sounds = json.load(f)
+        except FileNotFoundError:
+            self.user_sounds = {}
+        except json.JSONDecodeError:
+            self.user_sounds = {}
+
+
+    #writes the user_sounds dictionary back to disk
+    def save_user_sounds(self):
+        with open(self.USER_SOUNDS_FILE, "w", encoding="utf-8") as f:
+            json.dump(self.user_sounds, f, indent=2)
+
+
+    #gets list of approved sound files from SOUNDS_DIR
+    def list_available_sounds(self) -> list[str]:
+        allowed = {".mp3", ".wav", ".ogg"}
+        p = Path(self.SOUNDS_DIR)
+        if not p.exists():
+            return []
+
+        files = []
+        for f in p.iterdir():
+            if f.is_file() and f.suffix.lower() in allowed:
+                files.append(f.name)
+
+        #sort for nicer output
+        files.sort(key=str.lower)
+        return files
+
+
+    #resolve a user input like "bruh" into an actual filename in sounds folder
+    def resolve_sound_choice(self, choice: str) -> str | None:
+        choice = choice.strip()
+        available = self.list_available_sounds()
+        if not available:
+            return None
+
+        #allow user to type "bruh" without extension
+        base = choice.lower()
+
+        for filename in available:
+            name_no_ext = Path(filename).stem.lower()
+            if base == name_no_ext or base == filename.lower():
+                return filename
+
+        return None
 
 
     #channel lookup helper
@@ -283,6 +350,52 @@ class JoinSound(commands.Cog):
             await ctx.reply("Couldn’t connect — is the configured channel still valid?")
 
 
+    #list available join sounds users can pick
+    @commands.command(name="sounds")
+    async def sounds(self, ctx: commands.Context):
+        files = self.list_available_sounds()
+        if not files:
+            return await ctx.reply("No sounds found. Add files to the `sounds/` folder (mp3/wav/ogg).")
+
+        #show without extensions for nicer UX
+        names = [Path(f).stem for f in files]
+        await ctx.reply("Available sounds:\n- " + "\n- ".join(names))
+
+
+    #show what sound you currently have selected
+    @commands.command(name="mysound")
+    async def my_sound(self, ctx: commands.Context):
+        selected = self.user_sounds.get(str(ctx.author.id))
+        if not selected:
+            return await ctx.reply("You don't have a join sound set. (Using default `join.mp3`)")
+
+        await ctx.reply(f"Your join sound is set to: **{Path(selected).stem}**")
+
+
+    #pick a sound from the approved list
+    @commands.command(name="setsound")
+    async def set_sound(self, ctx: commands.Context, *, sound_name: str = None):
+        if not sound_name:
+            return await ctx.reply("Usage: `!setsound <soundname>`\nTry `!sounds` to see options.")
+
+        resolved = self.resolve_sound_choice(sound_name)
+        if not resolved:
+            return await ctx.reply("Sound not found. Use `!sounds` to see available options.")
+
+        self.user_sounds[str(ctx.author.id)] = resolved
+        self.save_user_sounds()
+        await ctx.reply(f"✅ Your join sound is now: **{Path(resolved).stem}**")
+
+
+    #reset to default join.mp3
+    @commands.command(name="clearsound")
+    async def clear_sound(self, ctx: commands.Context):
+        if str(ctx.author.id) in self.user_sounds:
+            self.user_sounds.pop(str(ctx.author.id), None)
+            self.save_user_sounds()
+        await ctx.reply("✅ Cleared. You will use default `join.mp3` again.")
+
+
 
 
     #this is the magic, the core trigger
@@ -335,8 +448,17 @@ class JoinSound(commands.Cog):
 
                 self.last_play_time[guild.id] = now
 
+                #pick user's custom sound if set, otherwise use default join.mp3
+                chosen_file = self.user_sounds.get(str(member.id), self.AUDIO_FILE)
+
+                #if it's a custom sound, it lives in sounds/ folder
+                if chosen_file != self.AUDIO_FILE:
+                    chosen_path = str(Path(self.SOUNDS_DIR) / chosen_file)
+                else:
+                    chosen_path = self.AUDIO_FILE
+
                 try:
-                    source = discord.FFmpegPCMAudio(self.AUDIO_FILE) #Uses FFmpeg to convert audio file
+                    source = discord.FFmpegPCMAudio(chosen_path) #Uses FFmpeg to convert audio file
                     vc.play(source) #Streams raw PCM audio into the voice channel
                 except Exception as e:
                     print("Playback error:", e)
